@@ -1,15 +1,19 @@
-#
-
-MySQL binlog
-   ↓
-Debezium connector
-   ↓
-Structured CDC event (Kafka Connect record)
-   ↓
-Outbox Event Router SMT
-   ↓
-Domain event (Kafka record)
-
-### Relationship between binlog and CDC events
-
-binlog entry → interpreted → normalized → enriched → serialized
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Kafka Broker   │     │  Kafka Broker   │     │  Kafka Broker   │
+│    (Pod 1)      │     │    (Pod 2)      │     │    (Pod 3)      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+         ▲                      ▲                      ▲
+         │                      │                      │
+         └──────────────────────┼──────────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │   Kafka Connect       │
+                    │   (1+ pods)           │
+                    │   with Debezium       │
+                    └───────────────────────┘
+                                │
+                                ▼
+                    ┌───────────────────────┐
+                    │   Source Database     │
+                    │   (MySQL/Postgres)    │
+                    └───────────────────────┘
