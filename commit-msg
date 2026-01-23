@@ -1,0 +1,30 @@
+#!/bin/bash
+# Git hook to remove Claude Code attribution lines from commit messages
+#
+# This hook removes the last two lines if they match:
+# - "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+# - "Co-Authored-By: Claude <noreply@anthropic.com>"
+
+COMMIT_MSG_FILE=$1
+
+# Create a temporary file
+temp_file=$(mktemp)
+
+# Process the file line by line, removing the specific lines
+grep -v "🤖 Generated with \[Claude Code\]" "$COMMIT_MSG_FILE" | \
+grep -v "Co-Authored-By: Claude.*<noreply@anthropic.com>" > "$temp_file"
+
+# Remove trailing blank lines using a Python one-liner (more portable)
+python3 -c "
+import sys
+with open('$temp_file', 'r') as f:
+    lines = f.readlines()
+# Remove trailing blank lines
+while lines and lines[-1].strip() == '':
+    lines.pop()
+with open('$temp_file', 'w') as f:
+    f.writelines(lines)
+" 2>/dev/null
+
+# Replace original file with cleaned version
+mv "$temp_file" "$COMMIT_MSG_FILE"
