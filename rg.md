@@ -238,6 +238,111 @@ which is smaller.
 
 ---
 
+## Detection & Trigger: Distinguishing a Blip from an Outage
+
+**There is no exception that distinguishes a blip from an outage — they throw the *same*
+exception.** "Connection refused" / "couldn't get a connection from the pool" looks
+identical whether the DB is gone for 2 seconds or 2 hours. A blip *is* an outage that
+happened to end quickly; the difference is purely **temporal**, so it cannot live in the
+exception type. Anything trying to classify blip-vs-outage at the moment the first exception
+fires is chasing information that doesn't exist yet.
+
+Split the problem into the two axes that *are* answerable.
+
+### Axis 1 — Exception type → infra vs. poison (not blip vs. outage)
+
+Type is good for the classification the design already needs. Route on concrete Spring
+`DataAccessException` leaves:
+
+- **Infrastructure / connectivity (pausable):** `CannotGetJdbcConnectionException`,
+  `DataAccessResourceFailureException`, `CannotCreateTransactionException`,
+  `QueryTimeoutException`. With HikariCP, "pool can't reach DB" surfaces as
+  `SQLTransientConnectionException` ("Connection is not available, request timed out
+  after …"), which Spring translates to `CannotGetJdbcConnectionException`.
+- **Data / poison:** `DataIntegrityViolationException`, `BadSqlGrammarException`, etc.
+  → exceptions table, as today.
+
+> **Caveat — don't use the abstract category as the retry signal.** Spring's
+> `NonTransientDataAccessException` means "won't succeed on an *immediate* retry without
+> something changing" — but a DB coming back up *is* that change, and connectivity failures
+> (`CannotGetJdbcConnectionException`) sit on the resource-failure / non-transient branch
+> despite being exactly what you want to retry-then-pause on. **Catch the specific
+> connectivity classes, not the abstract `TransientDataAccessException` /
+> `NonTransientDataAccessException` split.**
+
+### Axis 2 — Pausing *before* maxing retries: shared, fast-tripping failure state
+
+Per-record retry **structurally cannot** do this, because retry has **no memory across
+records**. Record 1 retries 5× and exhausts; record 2 starts fresh and retries 5× of its
+own; every record independently rediscovers the outage. Nothing accumulates the signal
+"the DB has failed 40 times in a row across 8 records."
+
+A **circuit breaker (Resilience4j)** around the DB write provides exactly that shared state.
+The shared state is **two-fold**, and the distinction matters because the first benefit is
+the load-bearing one:
+
+1. **Shared across records (temporal) — the fundamental reason.** Retry state is scoped to a
+   *single record's attempt* and discarded when that attempt ends. A breaker is a single
+   long-lived object whose failure tally **outlives any individual record's processing**:
+   record 1's failures *increment* the breaker, so when record 2 arrives the breaker is
+   already counting toward (or past) its threshold. **This holds even on a single thread** —
+   one listener thread, one partition, still benefits, because the problem isn't concurrency,
+   it's that per-record retry throws away the "failures are accumulating across records"
+   signal each time a record finishes.
+2. **Shared across threads (concurrent) — an amplifier.** With multiple consumer threads
+   (multiple partitions / concurrent listeners) hitting the same dead DB, the breaker is
+   thread-safe shared state that aggregates failures from *all* of them into one tally,
+   tripping faster; once open, *every* thread short-circuits immediately instead of each
+   burning its own retry budget.
+
+> Threading makes the breaker's advantage **larger**, but it is not the reason a breaker is
+> needed — a single-threaded consumer still needs one. The clean framing: **retry asks
+> "should I try *this operation* again?" (scoped to one attempt); the breaker asks "is the
+> *dependency* healthy right now?" (scoped to the resource, persisting across every record
+> that touches it).** Different question, different lifetime — and that difference in
+> lifetime is the answer.
+
+It is also the cleanest single mechanism because it solves **detection *and* recovery**:
+
+- **Closed (normal):** retries absorb individual blips, which self-resolve inside the retry
+  budget. The breaker barely notices a blip.
+- **Open (outage):** trip on a small consecutive-failure count or failure-rate threshold
+  over a sliding window (e.g. ~5–10 failures). That fires *far* faster than chewing through
+  a long retry budget on a single record — and because the state is **shared**, the *second*
+  record to hit the dead DB sees an already-open breaker and pauses **immediately** instead
+  of running its own full retry cycle. The outage is detected **once, fast, and applied to
+  all threads at once** → this is what gets you ahead of `max.poll.interval.ms`. On open →
+  pause the listener container.
+- **Half-open (probe):** the breaker periodically lets one probe through; success → close →
+  `resume()` the container. **The half-open probe *is* your "is the DB back?" check** — no
+  separate resume poller needed.
+
+### The health signal, in descending latency
+
+1. **Resilience4j half-open probe** — fast, push-ish, doubles as the resume trigger. **Best
+   / primary.**
+2. **Spring Boot Actuator `DataSourceHealthIndicator`** — runs `Connection.isValid()` / a
+   validation query, but **pull-based** (evaluated on health scrape) and scheduled, so it
+   lags. Use as a coarse secondary signal or to feed k8s probes / the Tier-3 stop-restart —
+   not the primary fast-trip.
+3. **HikariCP metrics** — `pendingThreads` climbing and connection-acquisition timeouts
+   spiking are an early "pool can't reach DB" tell. Good for alerting and as breaker input.
+
+> **Nuance for alerting (not for the pause decision):**
+> `CannotGetJdbcConnectionException` fires both for *DB actually down* and for *pool
+> exhausted under our own load* (DB fine). For **pause**, the response is the same either
+> way — sustained inability to get a connection means pausing relieves pressure regardless
+> of cause. But include HikariCP pool stats so on-call can tell "DB down" from "we're
+> hammering our own pool."
+
+**Net trigger design:** exception type routes infra-vs-poison; a Resilience4j breaker around
+the DB write provides the shared, fast-tripping state that pauses the container *before* any
+single record's retry budget endangers the poll interval; its half-open probe resumes on
+recovery. This keeps you firmly in **Variant A** territory without depending on
+retry-exhaustion timing at all.
+
+---
+
 ## The Solution
 
 ### Tier 1 — Bounded retry (existing, kept)
@@ -249,8 +354,10 @@ escalating to non-recoverable. Keep polling (cheap empty polls), check DB health
 `resume()` on recovery. Rides out outages of arbitrary length, honors the invariant, no
 rebalance, no hot loop, no audit pollution.
 
-- Ideally driven by a DB `HealthIndicator` so the container pauses **proactively** at the
-  container level, rather than discovering the outage one failed record at a time.
+- Triggered **proactively** via the Resilience4j circuit breaker (see **Detection &
+  Trigger**) so the container pauses on the breaker opening — before any single record's
+  retry budget endangers `max.poll.interval.ms` — rather than discovering the outage one
+  failed record at a time. The breaker's half-open probe doubles as the resume signal.
 
 ### Tier 3 — Stop container + external restart (fallback breaker)
 `CommonContainerStoppingErrorHandler` stops the listener; an external supervisor (k8s probe
