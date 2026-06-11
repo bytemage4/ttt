@@ -151,6 +151,35 @@ client.
 
 ---
 
+## Where to Trigger the Pause: Interval vs. Max-Retries Time
+
+Both `max.poll.interval.ms` and the total time to exhaust max retries are **constants**.
+Their *relative* size determines whether an exhaustion-triggered pause is sufficient or
+whether you must pause proactively. Note that **success behaves identically in both
+variants** — a healthy DB never engages the retry budget, so the relationship only matters
+during an outage.
+
+| | **Variant A: `max.poll.interval.ms` > max-retries-time** | **Variant B: `max.poll.interval.ms` < max-retries-time** |
+|---|---|---|
+| **Success (DB healthy)** | Write succeeds (first try or quick blip), commit, poll again well within budget. Retry budget never fully spent. No eviction. | **Identical.** Healthy DB → no sustained retrying → gap between polls stays tiny. The relationship is irrelevant when retries aren't exhausted. |
+| **DB outage — old design (escalate-on-exhaustion)** | Retries **exhaust within the interval** → no eviction. But escalation writes to exceptions table → same dead DB → can't commit → re-poll same record → retry → exhaust → … **Hot loop.** Each cycle resets the interval, so no rebalance; partition stuck, CPU burn, no progress, no loss (offset never commits). | Retries **don't finish before the interval** → consumer self-evicts **mid-retry** (`LeaveGroup`) → partition reassigned → peer starts same offset → same dead DB → same eviction → **rebalance storm.** Worse than standing still. |
+| **DB outage — with pause** | **Pause-on-exhaustion works.** Exhaustion happens inside the interval, so you reach the pause decision, pause, cheap polls, resume on recovery. | **Pause-on-exhaustion does *not* save you** — eviction fires *before* you ever reach exhaustion. You must pause **proactively** (DB `HealthIndicator`, before the interval is hit), not after retries finish. |
+
+**Key takeaway:** where you put the pause trigger depends on which variant you're in.
+
+- **Variant A** — keeping total retry time comfortably **under** `max.poll.interval.ms` means
+  pausing *after* retry exhaustion is sufficient; exhaustion is guaranteed to land inside the
+  interval.
+- **Variant B** — if retry time can exceed the interval, an exhaustion-triggered pause is
+  **too late**; the consumer is already evicted. You must drive the pause from a proactive
+  health signal that fires *before* the interval elapses.
+
+> **Cleanest design:** stay in **Variant A** (size the retry budget below the interval)
+> *and* pause proactively off a DB `HealthIndicator`. Then you're never racing the clock,
+> and the pause decision doesn't depend on exhaustion timing at all.
+
+---
+
 ## Memory Is Not the Risk; Retention Is
 
 A long pause does **not** overflow memory — not on the consumer, not on the broker.
