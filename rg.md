@@ -1,410 +1,274 @@
-# Handling DB Unavailability in the Notification Consumer
+# Spike: `buf breaking` for proto-over-Kafka schema compatibility
 
-## Context & Invariant
-
-The notification system enforces a core architectural invariant:
-
-> **No offset is committed without a prior successful DB write — for both successful and failed events.**
-
-The goal is to **minimize or eliminate message loss**. Every event is classified as
-**recoverable** or **non-recoverable**:
-
-- **Recoverable** — transient failures (e.g. DB connectivity issues). Retried with backoff.
-- **Non-recoverable** — the event itself is bad (e.g. proto3 deserialization failure).
-  Persisted to the **exceptions table** + mapped to an event delivery, *then* the offset
-  is committed.
-
-A recoverable failure becomes non-recoverable once **max retries** is exhausted.
-
-The exceptions table is the **terminal durable sink** — it replaces the usual
-"non-recoverable → DLT" pattern with "non-recoverable → exceptions table."
-
-## The Gap
-
-Both the success path and the exceptions path write to the **same DB**. During a
-**prolonged DB outage**, *neither* path can complete:
-
-- The event can't be written (success path blocked).
-- It can't be escalated to the exceptions table either (that sink is also down).
-
-Under the old design, exhausting retries reclassified a **healthy** event as
-non-recoverable and tried to write it to the exceptions table — which hit the same dead
-DB. The offset never committed, the consumer re-polled the same message, and the
-**partition hot-looped**, blocked indefinitely.
-
-Two problems with that escalation:
-
-1. **Misclassification.** "Non-recoverable" is a property of the *event* (bad payload).
-   A DB outage is a property of the *infrastructure*; the event was fine. Escalating on
-   outage pollutes the audit data with perfectly good events.
-2. **Impossibility.** The escalation target (exceptions table) is on the same dead DB,
-   so the escalation can't succeed anyway — hence the hot loop.
+**Domain:** event-driven notifications (Kafka + protobuf event schemas)
+**Question under investigation:** Can `buf breaking` serve as a structural contract / compatibility gate for our event schemas, and what exactly does it (and does it not) protect?
+**Status:** Spike / evaluation notes
+**Owner:** Notifications team
 
 ---
 
-## The Core Distinction: Retry vs. Pause
+## 1. TL;DR / Recommendation
 
-These operate at **different layers** and solve different problems:
+`buf breaking` is a **CI/CD gate** (part of the Buf CLI), not a library linked into our Spring Boot services. It performs **structural schema compatibility checking**, not Pact-style consumer-driven contract testing. For strongly-typed proto-over-Kafka, structural compatibility is usually the *right* form of enforcement — Pact's value drops sharply once you already have a typed schema.
 
-| | **Retry** | **Pause (backpressure)** |
-|---|---|---|
-| Meaning | "Try the operation again" | "Stop pulling new work; the sink can't accept it" |
-| Scope | Per-record | Per-partition / per-container |
-| Bounded? | Yes (max retries) | No (indefinite) |
-| Right for | Transient blips (failover resolving in seconds) | Sustained outages (minutes to hours) |
+It is a **high-value, low-cost first line of defence** for a durable, replay-heavy proto-over-Kafka domain like ours, **provided** we:
 
-Retry is **not replaced** — it's kept for genuine blips. Pause is added as the **next
-tier**: instead of escalating exhausted retries to *non-recoverable*, escalate to
-*paused*.
+1. Pick the **category** deliberately (`WIRE` / `WIRE_JSON` vs `FILE`) — selects *which kinds* of break are caught.
+2. Pick the **baseline** deliberately (`--against` target) — selects *how far back* the guarantee reaches.
+3. Enforce **`reserved`** on every field deletion — closes the delete-then-reuse hole.
 
----
+What it **cannot** do is guarantee *semantic* compatibility (same wire shape, changed meaning/units, code that assumes a field is present). That stays with policy, defensive coding, and runtime safeguards.
 
-## Why Bounded Retry Cannot Ride Out a Long Outage: The Two-Clock Model
-
-A Kafka consumer is **two things running concurrently, watched by two independent
-clocks**. Your retry only feeds one of them.
-
-### The two threads
-
-- **Main thread** — runs your poll loop: `poll()` → process batch → loop. Your DB writes
-  and retry-with-backoff run *here*. While retrying, you're sitting *inside* the
-  processing step, between one `poll()` and the next.
-- **Heartbeat thread** — since KIP-62 (Kafka 0.10.1), a separate background thread that
-  sends a "still here" message to the group coordinator every `heartbeat.interval.ms`,
-  independently of what the main thread is doing.
-
-### The two clocks
-
-**Clock 1 — `session.timeout.ms` (watches heartbeats)**
-Question: *"Is this consumer alive at all?"* (crashed, network-partitioned, JVM frozen).
-Satisfied as long as the heartbeat thread keeps ticking — **which it does even while the
-main thread is blocked in a retry-backoff sleep**, because it's a separate thread. A
-consumer grinding through a 90-second retry loop looks perfectly healthy to this clock.
-
-**Clock 2 — `max.poll.interval.ms` (watches the cadence of `poll()` calls), default 5 min**
-Question: *"Is this consumer making progress, or alive-but-stuck?"* If the gap between
-two `poll()` calls exceeds this threshold, the coordinator concludes the consumer is
-**livelocked** — heartbeating, technically alive, but wedged on a batch it can't finish.
-
-> **Why two clocks?** Before KIP-62, heartbeats were piggybacked onto `poll()`, so a slow
-> batch tripped the session timeout — "dead" and "slow" were indistinguishable. Decoupling
-> them lets a healthy-but-slow consumer keep its membership, but it moves the real ceiling
-> onto `max.poll.interval.ms`.
-
-### What retry-in-the-loop does to the pair
-
-It keeps **Clock 1 happy** (background heartbeats fire throughout) while **starving Clock
-2** (no `poll()` call until the retry resolves). Your retry budget is therefore racing
-`max.poll.interval.ms` whether you intended it or not.
-
-**This is the hidden ceiling.** Your max-retries threshold being tuned to "a few minutes"
-isn't really a business choice about how many tries is reasonable — it's the consumer
-protocol forcing your hand.
-
-### The eviction, concretely
-
-When the interval is exceeded, the client **proactively sends `LeaveGroup`** and stops
-heartbeating — it removes *itself*. The coordinator reassigns the partition. When your
-processing thread finally finishes its retry and comes back to commit, it discovers it's
-no longer the owner: `CommitFailedException`, rejoin from scratch. In-flight work is gone;
-the offset was never committed (safe under the invariant, but paid for with a rebalance).
-
-### Why this compounds into a storm
-
-The partition lands on a peer consumer, which starts from the same last-committed offset —
-the same record — hits the **same dead DB**, runs the **same** retry, exceeds the **same**
-interval, evicts **itself**, and the partition bounces to the next instance. Every consumer
-takes a turn being kicked, none makes a byte of progress. A DB outage becomes a thrashing
-rebalance loop layered on top of the original hot-poll loop. **Worse than standing still.**
+> **Two orthogonal knobs — do not conflate them:**
+> - **Category** (`WIRE` / `WIRE_JSON` / `FILE`) = *which kinds* of break are caught.
+> - **Baseline** (`--against …`) = *how far back* in history the guarantee reaches.
+> You must set both correctly. "Stricter" is not a single dial.
 
 ---
 
-## How Pause Inverts the Relationship
+## 2. Core concepts (answers to specific questions asked)
 
-`pause(partition)` does **not** stop your loop — you keep calling `poll()` every iteration.
-A `poll()` on a fully-paused assignment returns almost immediately with nothing (paused
-partitions stop issuing fetch requests entirely). So:
+### 2.1 What does `buf breaking` actually compare? (regression-test mental model)
 
-- Each iteration is cheap; `poll()` is called constantly.
-- **Clock 2 (`max.poll.interval.ms`) is reset on every call** — never approaches the threshold.
-- **Clock 1** keeps ticking via the heartbeat thread.
+It builds **two protobuf images** (FileDescriptorSets) and diffs them:
 
-Both clocks satisfied, indefinitely, while doing zero work. You hold your assignment,
-nobody rebalances, and you simply wait — checking DB health on each cheap poll — until you
-`resume()`.
+- **Current** — image built from the protos at the **PR branch HEAD** (the working tree under review).
+- **Baseline** — image built from whatever `--against` points at, **resolved independently at that reference**.
 
-> **The structural reason:** retry *spends* the poll-interval budget; pause *refreshes* it.
+Because the baseline is resolved separately, the PR's own changes **never leak into it**. With `--against '.git#branch=main'`, buf builds main's image and the PR's image and diffs *PR-relative-to-main*. The evaluated delta is exactly the change under review — hence it reads like a **regression / golden test**: reference vs current, reference untouched by the current change.
 
-**The one footgun:** pausing and *also* stopping the poll loop ("we're paused, no need to
-poll"). That reintroduces the exact starvation — `max.poll.interval.ms` doesn't care *why*
-you stopped polling. **Contract: pause the partitions, but keep the loop spinning on cheap
-empty polls.**
+**The baseline advances only on merge.** Once the PR merges, `main` contains the new schema, so the *next* PR's baseline includes it. This is a **ratchet** — each merge moves the compatibility floor forward one step.
 
-### In Spring Boot
+> Contrast: `--against 'HEAD~1'` advances the baseline every commit, which only guarantees compatibility with the immediately prior commit — usually **not** what you want.
 
-`KafkaMessageListenerContainer` owns the poll loop on the listener thread; your
-`@KafkaListener` method is what it calls per record. When you pause the container (or a long
-`BackOff` triggers Spring's container-pausing behavior), Spring keeps running its internal
-poll loop and just stops *delivering* records to your method — doing the "keep polling,
-deliver nothing" dance for you, keeping `max.poll.interval.ms` fed without touching the raw
-client.
+### 2.2 What does "wire-incompatible" mean?
 
----
+A change alters the serialized bytes such that a message encoded under the old schema can no longer be read correctly under the new one (or vice versa) — either failing to parse or **silently corrupting** data.
 
-## Where to Trigger the Pause: Interval vs. Max-Retries Time
+Protobuf encodes fields by **field number + wire type**, *not* by name.
 
-Both `max.poll.interval.ms` and the total time to exhaust max retries are **constants**.
-Their *relative* size determines whether an exhaustion-triggered pause is sufficient or
-whether you must pause proactively. Note that **success behaves identically in both
-variants** — a healthy DB never engages the retry budget, so the relationship only matters
-during an outage.
+| Wire-**breaking** | Wire-**safe** |
+|---|---|
+| Changing a field's number | Renaming a field (name isn't on the wire) |
+| Changing a field's type (e.g. `int32` → `string`) | Adding a new field with a fresh number |
+| Reusing a deleted number for a new field | Reordering fields in the `.proto` |
+| Incompatible cardinality changes | — |
 
-| | **Variant A: `max.poll.interval.ms` > max-retries-time** | **Variant B: `max.poll.interval.ms` < max-retries-time** |
-|---|---|---|
-| **Success (DB healthy)** | Write succeeds (first try or quick blip), commit, poll again well within budget. Retry budget never fully spent. No eviction. | **Identical.** Healthy DB → no sustained retrying → gap between polls stays tiny. The relationship is irrelevant when retries aren't exhausted. |
-| **DB outage — old design (escalate-on-exhaustion)** | Retries **exhaust within the interval** → no eviction. But escalation writes to exceptions table → same dead DB → can't commit → re-poll same record → retry → exhaust → … **Hot loop.** Each cycle resets the interval, so no rebalance; partition stuck, CPU burn, no progress, no loss (offset never commits). | Retries **don't finish before the interval** → consumer self-evicts **mid-retry** (`LeaveGroup`) → partition reassigned → peer starts same offset → same dead DB → same eviction → **rebalance storm.** Worse than standing still. |
-| **DB outage — with pause** | **Pause-on-exhaustion works.** Exhaustion happens inside the interval, so you reach the pause decision, pause, cheap polls, resume on recovery. | **Pause-on-exhaustion does *not* save you** — eviction fires *before* you ever reach exhaustion. You must pause **proactively** (DB `HealthIndicator`, before the interval is hit), not after retries finish. |
+This name-vs-number distinction is why a rename is **wire-safe but source-breaking** — the basis of buf's `WIRE` vs `FILE` categories.
 
-**Key takeaway:** where you put the pause trigger depends on which variant you're in.
+### 2.3 What does `reserved` do?
 
-- **Variant A** — keeping total retry time comfortably **under** `max.poll.interval.ms` means
-  pausing *after* retry exhaustion is sufficient; exhaustion is guaranteed to land inside the
-  interval.
-- **Variant B** — if retry time can exceed the interval, an exhaustion-triggered pause is
-  **too late**; the consumer is already evicted. You must drive the pause from a proactive
-  health signal that fires *before* the interval elapses.
+`reserved` is a declaration inside a message that **permanently retires** specific field numbers (and optionally names) — off-limits for future reuse. It does **not** affect the wire format; it's a compiler-enforced tombstone.
 
-> **Cleanest design:** stay in **Variant A** (size the retry budget below the interval)
-> *and* pause proactively off a DB `HealthIndicator`. Then you're never racing the clock,
-> and the pause decision doesn't depend on exhaustion timing at all.
+```protobuf
+message NotificationEvent {
+  reserved 5;
+  reserved "user_id";
+  // ... other fields
+}
+```
 
----
+After this, protoc (and buf) will **reject** any future field numbered `5` or named `user_id` in that message.
 
-## Memory Is Not the Risk; Retention Is
+**Why it matters here:** deleting a field is wire-safe (old readers see it absent), but it frees the *number*. If a later version reuses that number with a different type, old bytes carrying the original field get **silently misread**. `reserved` makes that impossible — and crucially, it makes the **delete-then-reuse hole catchable by buf**: the tombstone is present in the baseline, so a reuse attempt is flagged even when buf only compares against the immediately prior version. It is the cheap, standard discipline that turns "compatible with the previous version" into something much closer to "compatible with all previous versions."
 
-A long pause does **not** overflow memory — not on the consumer, not on the broker.
+### 2.4 Categories: `WIRE` vs `WIRE_JSON` vs `FILE`
 
-- **Consumer heap stays flat.** `pause()` suppresses *fetching*, not just delivery. A paused
-  partition stops issuing fetch requests, so nothing new streams in. The most buffered is a
-  fetch-batch worth (`max.partition.fetch.bytes` per partition, `fetch.max.bytes` overall) —
-  not a growing backlog. Data accumulates on the **brokers' disks**, where it always lived
-  until fetched; pause just means you haven't fetched yet.
-- **Broker memory is flat too.** A lagging consumer costs ~nothing: messages are written to
-  the partition log (page cache + disk) by producers regardless of consumers, and your group's
-  position is a single offset in `__consumer_offsets`. A consumer 10M messages behind and one
-  caught up have the same broker-memory footprint: one offset.
+| Category | Protects | Lifecycle moment | Notes |
+|---|---|---|---|
+| `WIRE` | Binary wire compatibility | **Runtime** (bytes in motion / at rest) | Most permissive; the load-bearing guarantee for Kafka payloads |
+| `WIRE_JSON` | `WIRE` + JSON-mapping compatibility | **Runtime** | Sensible floor if any payloads are ever delivered as JSON (e.g. webhooks) |
+| `FILE` | Generated-source compatibility per language (default, strictest) | **Build-time** | Catches source breaks (e.g. renames) — but for a single-team-owned schema these are caught by our own compilation anyway |
 
-### The real risk: retention-driven silent loss
+**Key insight for our context:** the wire categories give a genuine **runtime** guarantee about bytes. `FILE` only adds a **build-time** property — for us it mostly moves a build failure from "after merge" to "in the PR" (nice, not a safety guarantee). Since we own one schema and compile everything against it, accessor/source breaks are **fully contained at build time** and are *not* a production risk.
 
-Messages keep being produced throughout the outage, governed by **retention**
-(`retention.ms`, default 7 days; `retention.bytes` if size-based is set). If the pause
-outlasts retention, the broker deletes the **oldest** log segments first — exactly the
-records not yet consumed. On `resume()`, the committed offset no longer exists →
-`OffsetOutOfRangeException` → `auto.offset.reset` kicks in:
+### 2.5 Backward vs. full compatibility (terminology flag)
 
-- `latest` — **silently skips** everything deleted (straight message loss).
-- `earliest` — jumps to oldest surviving record (loss of aged-out data + huge reprocess).
+Our system needs compatibility in **both directions**:
 
-Either way: **silent message loss** — worse than the hot loop, because nothing errors.
+- **Forward:** a new producer emits an event read by an older consumer.
+- **Backward:** an old event (topic / outbox / event store) is read by a newer consumer after replay.
 
-> Pause trades a **rebalance-loss** risk for a **retention-loss** risk. Size the second
-> one deliberately.
-
-**Precision on the retention clock:** retention ages each record by its **own produce
-timestamp** on the log, independent of consumer state. So the real question isn't "can I
-stay paused longer than retention," it's **"is my consumer's lag (oldest-unconsumed
-message's age) approaching the retention window."** If you entered the outage caught-up
-these are equivalent; if you were already lagging, headroom is `retention − existing_lag`,
-which is smaller.
+Protobuf's wire rules are largely **symmetric**, so the `WIRE` / `WIRE_JSON` category enforces both structurally. State this explicitly to the team so nobody reasons about only one direction.
 
 ---
 
-## Retention Configuration (reference)
+## 3. Scenario coverage map (what buf covers vs. what needs other approaches)
 
-- Retention is a **per-topic** config: `retention.ms`, `retention.bytes`, set at topic
-  creation or via `kafka-configs --alter`.
-- Broker-level `log.retention.ms` / `log.retention.bytes` / `log.retention.hours` are only
-  the **defaults** a topic inherits; explicit topic config overrides them.
-- Limits apply **per partition**. `retention.bytes` caps each partition's log, so a topic's
-  total footprint ≈ `retention.bytes` × partition count.
+Our schema is **single, team-owned, shared by producer and consumer**, which collapses the *divergence* risk almost entirely and relocates residual risk to **temporal coexistence of bytes** — different schema versions in flight or at rest at the same moment. Every scenario below is a variant of "vN-encoded bytes meet vN±k code."
 
-> **On "disk full":** rare not because the disk is too big, but because **retention is
-> designed to prevent it** — time-based retention caps each partition at ≈ throughput ×
-> window and continuously deletes old segments, reaching a steady state. Disk-full still
-> *can* happen for reasons retention doesn't govern (retention set higher than the disk
-> holds, another high-volume topic sharing the volume, partition skew, a runaway producer,
-> a stuck segment) — but that's ops/capacity-planning territory, separate from the
-> consumer-loss path. **Retention is the real threshold for this design.**
+| # | Scenario | buf covers (structural) | Needs other approaches (semantic / operational / build) |
+|---|---|---|---|
+| 1 | Producer & consumer on different stub versions (by omission) | The compat guarantee makes skew **harmless at parse level** (newer extra fields skipped; missing fields → defaults) | Dependency hygiene: single versioned stub artifact, central BOM pin, Renovate/Dependabot. Semantic sliver: producer sets a field a stale consumer needs → **deploy consumer first** |
+| 2 | In-flight messages during rolling / canary deploys | **Fully owned** — mixed-version coexistence is exactly what the wire guarantee certifies | **Expand/contract (two-phase) deploy ordering** for semantically directional changes (readers before writers; stop writing before delete) |
+| 3 | Stored serialized bytes (outbox + event store) | Structural compat **back to the chosen baseline** (needs cumulative-floor baseline + `reserved`) | **Defensive consumer coding** (treat absent/default as a real case); **envelope schema-version stamp** for debuggability + future migration |
+| 4 | Consumer offset reset across multi-version history | Same as #3; **topic retention bounds the window** | Same as #3 |
+| 5 | Replay of upstream public events | Only **once internalised** — buf in our repo says nothing about a schema we don't own | **Anti-corruption layer** at ingestion: translate upstream → our internal schema, store/replay the normalised form → collapses #5 into #3 |
+| 6 | protoc / runtime version mismatch | Addressed via buf's **codegen** side, not the breaking check | Single stub artifact built once with pinned protoc; pin plugins in `buf.gen.yaml`; **keep protobuf-java gencode and runtime versions aligned** (the one real footgun) |
 
----
+**One-sentence split:** buf guarantees that across all versions the bytes always **parse** (structural side of #2, #3, #4, and #5-once-internalised); everything about what those bytes **mean** when a field is missing, whether the right code is deployed in the right order, and how we handle schemas we don't own falls to defensive coding, version stamping, expand/contract deploys, and an anti-corruption layer.
 
-## Detection & Trigger: Distinguishing a Blip from an Outage
-
-**There is no exception that distinguishes a blip from an outage — they throw the *same*
-exception.** "Connection refused" / "couldn't get a connection from the pool" looks
-identical whether the DB is gone for 2 seconds or 2 hours. A blip *is* an outage that
-happened to end quickly; the difference is purely **temporal**, so it cannot live in the
-exception type. Anything trying to classify blip-vs-outage at the moment the first exception
-fires is chasing information that doesn't exist yet.
-
-Split the problem into the two axes that *are* answerable.
-
-### Axis 1 — Exception type → infra vs. poison (not blip vs. outage)
-
-Type is good for the classification the design already needs. Route on concrete Spring
-`DataAccessException` leaves:
-
-- **Infrastructure / connectivity (pausable):** `CannotGetJdbcConnectionException`,
-  `DataAccessResourceFailureException`, `CannotCreateTransactionException`,
-  `QueryTimeoutException`. With HikariCP, "pool can't reach DB" surfaces as
-  `SQLTransientConnectionException` ("Connection is not available, request timed out
-  after …"), which Spring translates to `CannotGetJdbcConnectionException`.
-- **Data / poison:** `DataIntegrityViolationException`, `BadSqlGrammarException`, etc.
-  → exceptions table, as today.
-
-> **Caveat — don't use the abstract category as the retry signal.** Spring's
-> `NonTransientDataAccessException` means "won't succeed on an *immediate* retry without
-> something changing" — but a DB coming back up *is* that change, and connectivity failures
-> (`CannotGetJdbcConnectionException`) sit on the resource-failure / non-transient branch
-> despite being exactly what you want to retry-then-pause on. **Catch the specific
-> connectivity classes, not the abstract `TransientDataAccessException` /
-> `NonTransientDataAccessException` split.**
-
-### Axis 2 — Pausing *before* maxing retries: shared, fast-tripping failure state
-
-Per-record retry **structurally cannot** do this, because retry has **no memory across
-records**. Record 1 retries 5× and exhausts; record 2 starts fresh and retries 5× of its
-own; every record independently rediscovers the outage. Nothing accumulates the signal
-"the DB has failed 40 times in a row across 8 records."
-
-A **circuit breaker (Resilience4j)** around the DB write provides exactly that shared state.
-The shared state is **two-fold**, and the distinction matters because the first benefit is
-the load-bearing one:
-
-1. **Shared across records (temporal) — the fundamental reason.** Retry state is scoped to a
-   *single record's attempt* and discarded when that attempt ends. A breaker is a single
-   long-lived object whose failure tally **outlives any individual record's processing**:
-   record 1's failures *increment* the breaker, so when record 2 arrives the breaker is
-   already counting toward (or past) its threshold. **This holds even on a single thread** —
-   one listener thread, one partition, still benefits, because the problem isn't concurrency,
-   it's that per-record retry throws away the "failures are accumulating across records"
-   signal each time a record finishes.
-2. **Shared across threads (concurrent) — an amplifier.** With multiple consumer threads
-   (multiple partitions / concurrent listeners) hitting the same dead DB, the breaker is
-   thread-safe shared state that aggregates failures from *all* of them into one tally,
-   tripping faster; once open, *every* thread short-circuits immediately instead of each
-   burning its own retry budget.
-
-> Threading makes the breaker's advantage **larger**, but it is not the reason a breaker is
-> needed — a single-threaded consumer still needs one. The clean framing: **retry asks
-> "should I try *this operation* again?" (scoped to one attempt); the breaker asks "is the
-> *dependency* healthy right now?" (scoped to the resource, persisting across every record
-> that touches it).** Different question, different lifetime — and that difference in
-> lifetime is the answer.
-
-It is also the cleanest single mechanism because it solves **detection *and* recovery**:
-
-- **Closed (normal):** retries absorb individual blips, which self-resolve inside the retry
-  budget. The breaker barely notices a blip.
-- **Open (outage):** trip on a small consecutive-failure count or failure-rate threshold
-  over a sliding window (e.g. ~5–10 failures). That fires *far* faster than chewing through
-  a long retry budget on a single record — and because the state is **shared**, the *second*
-  record to hit the dead DB sees an already-open breaker and pauses **immediately** instead
-  of running its own full retry cycle. The outage is detected **once, fast, and applied to
-  all threads at once** → this is what gets you ahead of `max.poll.interval.ms`. On open →
-  pause the listener container.
-- **Half-open (probe):** the breaker periodically lets one probe through; success → close →
-  `resume()` the container. **The half-open probe *is* your "is the DB back?" check** — no
-  separate resume poller needed.
-
-### The health signal, in descending latency
-
-1. **Resilience4j half-open probe** — fast, push-ish, doubles as the resume trigger. **Best
-   / primary.**
-2. **Spring Boot Actuator `DataSourceHealthIndicator`** — runs `Connection.isValid()` / a
-   validation query, but **pull-based** (evaluated on health scrape) and scheduled, so it
-   lags. Use as a coarse secondary signal or to feed k8s probes / the Tier-3 stop-restart —
-   not the primary fast-trip.
-3. **HikariCP metrics** — `pendingThreads` climbing and connection-acquisition timeouts
-   spiking are an early "pool can't reach DB" tell. Good for alerting and as breaker input.
-
-> **Nuance for alerting (not for the pause decision):**
-> `CannotGetJdbcConnectionException` fires both for *DB actually down* and for *pool
-> exhausted under our own load* (DB fine). For **pause**, the response is the same either
-> way — sustained inability to get a connection means pausing relieves pressure regardless
-> of cause. But include HikariCP pool stats so on-call can tell "DB down" from "we're
-> hammering our own pool."
-
-**Net trigger design:** exception type routes infra-vs-poison; a Resilience4j breaker around
-the DB write provides the shared, fast-tripping state that pauses the container *before* any
-single record's retry budget endangers the poll interval; its half-open probe resumes on
-recovery. This keeps you firmly in **Variant A** territory without depending on
-retry-exhaustion timing at all.
+**Note on accessor breakage:** a wire-safe-but-source-breaking change (e.g. a rename) can **only** fail at *compile time inside a single repo*, never across the wire. It is **not** a production risk and is removed from the runtime threat model entirely.
 
 ---
 
-## The Solution
+## 4. Semantic compatibility is a different kind of property
 
-### Tier 1 — Bounded retry (existing, kept)
-For genuine transient blips (e.g. a failover resolving in seconds). Unchanged.
+buf is deterministic about **structure**; semantic compatibility largely **resists a deterministic gate**, because whether code behaves correctly against an older version depends on field *intent* and the reading logic — e.g. `0` parsed as a default may mean "producer didn't set this" or "a real quantity of zero," and no differ can know which. That intent isn't in the schema structure, so there's nothing structural to check.
 
-### Tier 2 — Pause / resume with backoff (primary outage handler)
-When retries exhaust on an **infrastructure** failure, **pause** the partition instead of
-escalating to non-recoverable. Keep polling (cheap empty polls), check DB health each cycle,
-`resume()` on recovery. Rides out outages of arbitrary length, honors the invariant, no
-rebalance, no hot loop, no audit pollution.
+But the semantic half is **not** purely vibes — it's a spectrum of enforceable conventions:
 
-- Triggered **proactively** via the Resilience4j circuit breaker (see **Detection &
-  Trigger**) so the container pauses on the breaker opening — before any single record's
-  retry budget endangers `max.poll.interval.ms` — rather than discovering the outage one
-  failed record at a time. The breaker's half-open probe doubles as the resume signal.
-
-### Tier 3 — Stop container + external restart (fallback breaker)
-`CommonContainerStoppingErrorHandler` stops the listener; an external supervisor (k8s probe
-/ health check / `KafkaListenerEndpointRegistry`) restarts it when healthy. Same invariant,
-but heavier (rebalance, discarded in-flight state, cold-start cost). **Reserve for
-consumer-level wedging** (poisoned connection pool, wedged client state) — *not* the default
-for DB outage, where it's strictly worse than pause.
-
-### Why **no DLT**
-The exceptions table is already the terminal sink, so a DLT is redundant. The *only*
-scenario it would help is a conjunction:
-
-> non-recoverable event **AND** DB outage **AND** retention window exceeded / broker disk full
-
-That's a conjunction of independent low-probability conditions. Once pause + lag-vs-retention
-alerting keeps you well inside the retention window, the conjunction effectively cannot
-arise. A DLT would add ordering complexity (the main stream advances past the dead-lettered
-record; strict per-key order across the split needs stateful "poisoned-key" routing) and a
-reconciliation path — complexity paid against a risk already designed out.
-
-The cleaner rule sidesteps it entirely: **gate the partition on DB health, not on the
-event's classification.** One durable sink serves both paths, so if it's down, pause —
-regardless of whether the current record is recoverable or non-recoverable. Nothing is
-skipped, so order is preserved trivially; when the DB returns, write the deserialization
-failure to the exceptions table and proceed as normal.
+- Defensive reading of any field younger than the oldest baseline → lint rules / review checklists.
+- Envelope schema-version stamp → a concrete artifact you either have or don't.
+- Expand/contract deploy ordering → enforceable in the deployment pipeline.
+- Anti-corruption layer for upstream events → an architectural requirement.
+- **Org-wide full-backward-compatibility policy** → the umbrella principle the practices implement.
 
 ---
 
-## Operational Backstops
+## 5. Industrial alternative considered (deliberate "no")
 
-- **Idempotency.** Not committing guarantees redelivery; the previously-failed message is
-  reprocessed when the DB returns. Keep processing idempotent (the event-delivery mapping is
-  presumably the dedup key). Confirm the exceptions-row write + event-delivery mapping is a
-  **single transaction**; if separate, make the pair idempotent so redelivery doesn't
-  double-write.
-- **Alerting = a countdown against retention.** Auto-recover on DB health, but a partition
-  paused beyond a threshold must **page someone** — a silently stalled consumer is the
-  failure mode that replaces the hot loop. Watch **consumer lag / oldest-unconsumed-offset
-  age against retention**, not pause duration in isolation. With 7-day retention, paging at
-  ~1 hour of continuous pause leaves enormous runway, and the silent-loss scenario never
-  gets a chance to happen.
+A **Schema Registry** (e.g. Confluent, with protobuf support) enforces compatibility at registration time **and** stamps every message with a schema ID — directly addressing #1–#4 by recording what wrote each byte. But given we already own the single schema and gate it with buf in CI, the registry's *enforcement* is largely **redundant**. The part that adds real value — schema-ID stamping — is obtainable far more cheaply via an **envelope field**. The registry earns its runtime cost mainly if we later **lose single-ownership** or want central runtime enforcement we don't trust CI to provide.
 
 ---
 
-## One-line summary for the design doc
+## 6. Scoping the check to *our* files in a repo we don't own
 
-> *Offset never advances without a durable DB write; during DB unavailability the partition
-> pauses (bounded retry for blips, indefinite pause for outages) rather than advancing or
-> hot-looping, with stop/restart as a consumer-level fallback and lag-vs-retention alerting
-> as the backstop against silent loss.*
+We do not own the repo holding the system-wide proto schemas. `buf breaking` supports **path scoping**, so we don't have to check the whole repo.
+
+### 6.1 Allowlist — `--path` (repeatable)
+
+```bash
+buf breaking --against '.git#branch=main' \
+  --path proto/notifications \
+  --path proto/common/envelope.proto
+```
+
+- `--path` filters **both** current input **and** baseline to the same paths → diffs our subset against the historical version of that same subset (correct behaviour).
+- In recent Buf CLI versions, `--path` is being superseded by `--include-path` / `--exclude-path` — **check `buf breaking --help` on the pinned CI version** (the spelling shifted around the v1.32-ish era).
+
+### 6.2 Denylist — `--exclude-path`
+
+Inverse approach: exclude the directories we **don't** own, so anything new under *our* tree is covered by default. Prefer this if our surface is large/growing; prefer the allowlist if our files are a small fixed set. **Pick whichever list is shorter and more stable.**
+
+### 6.3 Hard constraint: imports must still resolve
+
+The scoped paths must still **build as a complete set**. If our protos `import` shared types (e.g. `common/`), those imports must resolve — buf needs the full import graph to build the image, even though it only *evaluates breakage* on the filtered paths. In practice: point buf at the **repo root** as the module so imports resolve, and use path flags to scope **what's checked**. We don't have to own the imported files; they just have to be present and parseable.
+
+### 6.4 Governance question buf can't decide for us
+
+**A CI gate only protects changes that flow through that CI.** Two things to settle with the owning team:
+
+1. **Where the gate lives + baseline.** In *their* repo's CI → `--against main` is natural. In *our* CI against their repo as an external input → `--against` a git URL/ref for their repo (needs read access + a stable ref).
+2. **Coverage of *all* changes.** Can someone else merge a change to our protos — **or to a shared `common` type we import** — without our buf check running? If the check isn't a **required status on their PRs**, it protects our PRs but not theirs, and a shared-type change by another team is exactly the break that hits us. Confirm the check is a **required** status on the paths we depend on (e.g. CODEOWNERS on our proto dirs + required buf-breaking status), owned at repo level — not just present in our own branch builds.
+
+---
+
+## 7. Setup recipes
+
+Two recipes. **Recipe A (neighbouring-version)** is the simple incremental gate. **Recipe B (cumulative-floor)** is the one that insulates against in-flight / stored payloads built on **more than two neighbouring schema versions** — back to the oldest live schema version. **Recommended: run both** (fast incremental gate on every PR + cumulative floor).
+
+### Recipe A — Neighbouring-version gate (pairwise against `main`)
+
+**Goal:** every change is compatible with the immediately preceding released state. Cheap, fast, catches the common case. Composes inductively for most wire rules, **but has the delete-then-reuse hole** unless `reserved` is enforced.
+
+**`buf` configuration requirements**
+
+- Baseline: `--against '.git#branch=main'` (the ratchet — advances on merge).
+- Category: at least `WIRE`; use **`WIRE_JSON`** as the floor for event topics (webhook/JSON delivery). Reserve `FILE` only if you want in-PR build-break detection.
+- Scope (shared repo): `--path` (or `--exclude-path`) per §6, with imports resolvable from repo root.
+
+`buf.yaml` (v2):
+
+```yaml
+version: v2
+modules:
+  - path: .
+breaking:
+  use:
+    - WIRE_JSON      # runtime wire + JSON-mapping compatibility
+  # ignore_unstable_packages: true   # optional, if you keep *.v1alpha etc.
+lint:
+  use:
+    - STANDARD
+  # FIELD_NOT_DELETED-style discipline is enforced via reserved (see proto guidelines)
+```
+
+CI step:
+
+```bash
+buf breaking \
+  --against '.git#branch=main' \
+  --path proto/notifications \
+  --path proto/common/envelope.proto
+```
+
+**Proto design guidelines (mandatory for this recipe to be sound)**
+
+- **Always `reserved` on deletion** — number **and** name. Without it, delete-then-reuse across ≥2 versions slips through, because the original definition isn't in the (single, neighbouring) baseline.
+- Never change a field's number or type; add a new field with a fresh number instead.
+- Never recycle a number; treat the number space as append-only.
+
+### Recipe B — Cumulative-floor gate (against the oldest live schema tag)
+
+**Goal:** current code is structurally compatible with **every** historical version still reachable — outbox/event-store payloads, offset resets, replays — i.e. the full accumulated span, not just the neighbour. **This is the recipe that addresses payloads built on more than two neighbouring versions.**
+
+**Determine the floor first.** The floor tag = the **oldest schema version whose bytes can still reach current code**:
+
+- **Topic retention** bounds offset-reset/in-flight scenarios (e.g. 7-day retention → 7 days back). Infinite/compacted → whole history.
+- **Event store / outbox** is effectively append-only forever → its floor is the **true cumulative horizon** (usually the binding one).
+- Tag that oldest-still-live schema version, e.g. `schema-floor-v1.0.0`, and **bump the floor only when** the corresponding old payloads are provably no longer reachable (retention expired *and* no event-store records remain / all migrated).
+
+**`buf` configuration requirements**
+
+- Baseline: `--against '.git#tag=schema-floor-v1.0.0'` (a **fixed** reference, not `main`) → cumulative guarantee across the whole span.
+- Category: same as Recipe A (`WIRE` / `WIRE_JSON`); category choice is **independent** of baseline.
+- Scope: same path-scoping as §6.
+
+`buf.yaml` is identical to Recipe A (category/scope don't change). Only the **`--against` target** differs.
+
+CI step:
+
+```bash
+# Cumulative floor: must stay compatible with the oldest still-reachable schema version
+buf breaking \
+  --against '.git#tag=schema-floor-v1.0.0' \
+  --path proto/notifications \
+  --path proto/common/envelope.proto
+```
+
+**Proto design guidelines (mandatory for this recipe to be sound)**
+
+- **`reserved` on every deletion** (number + name) — same as Recipe A; here it's what keeps the long span honest against delete-then-reuse.
+- Treat field numbers as **append-only forever** — no reuse, ever, within the cumulative horizon.
+- For any field added after the floor, ensure consumer logic treats **absent/default as a valid, expected case** (this is the semantic complement buf can't enforce — see §4).
+- Stamp each stored payload with an **envelope schema-version field** so old data is debuggable and a future *hard* migration (upcasters) stays possible.
+
+### Recommended combined CI (both gates)
+
+```bash
+set -euo pipefail
+
+PATHS=( --path proto/notifications --path proto/common/envelope.proto )
+
+# 1) Fast incremental gate — compatibility with the latest released state
+buf breaking --against '.git#branch=main' "${PATHS[@]}"
+
+# 2) Cumulative floor — compatibility with the oldest still-reachable schema version
+buf breaking --against '.git#tag=schema-floor-v1.0.0' "${PATHS[@]}"
+
+# 3) Style/discipline (incl. reserved enforcement via proto review)
+buf lint "${PATHS[@]}"
+```
+
+> Reminder: both gates are **structural only**. They guarantee bytes parse back to their respective baselines. Semantic correctness (§4), deploy ordering (§3 #2), dependency pinning (§3 #1, #6), and the anti-corruption layer for upstream events (§3 #5) remain separate, required practices.
+
+---
+
+## 8. Open follow-ups
+
+- Confirm whether our buf check can be made a **required status** on the owning team's PRs (incl. shared `common` types we import) — §6.4.
+- Decide the **floor tag** and the policy for bumping it (retention + event-store reachability) — §7 Recipe B.
+- Design the **envelope schema-version stamp** for outbox/event-store payloads (prerequisite for future upcasters).
+- Decide `WIRE` vs `WIRE_JSON` floor for event topics (webhook JSON delivery argues for `WIRE_JSON`).
+- Define the **expand/contract** deploy-ordering convention and where it's enforced in the pipeline.
