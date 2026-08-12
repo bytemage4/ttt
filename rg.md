@@ -1,119 +1,249 @@
-# Notification Pipeline — Template Data Access Architecture Summary
+# Feeding Team Knowledge to a Domain Plugin
 
-## Current Architecture
+An implementation guide for turning Confluence spikes into a scoped, PR-gated knowledge layer for a Claude Code plugin used in day-to-day development and code review.
 
-The system is a **sequential notifications pipeline** made up of three services connected through Kafka with Debezium running in outbox mode. Events flow through the pipeline asynchronously, each stage producing events that the next one consumes.
+---
 
-The **middle service — the email processor (EP)** — is the one under discussion. Its responsibility is processing notifications and rendering emails. To do that, it reads a lot of domain reference data: email notification templates, notification configurations, brands, and a few other types. Historically this data was **seeded manually**, so EP simply read it from its tables. It was static reference data with no write-side lifecycle.
+## 1. The shape of the solution
 
-On the persistence side, everything sits on a **shared Aurora cluster** (the org-standardized stack), with services following a schema-per-service model in which each one reads only its own tables. Aurora exposes writer and reader endpoints, the reader endpoint load-balancing across replicas. EP already **caches raw templates in Redis**.
+The question "feed spikes directly or distill them?" resolves into neither. What works is a **layered store** where each layer has a distinct lifecycle, a distinct authority level, and a distinct loading trigger.
 
-The recent change is the introduction of a **template editor** — an internal tool, a UI plus a BFF exposed over REST — through which internal users create and edit templates directly. This capability may later extend to editing the other data types (configs, brands) as well.
+| Layer | Content | Size | Loaded |
+|---|---|---|---|
+| **Core** | Terminology, hard invariants, system-wide requirements | ~1 page, laminated-card scale | Always |
+| **Index** | One line per decision: `id`, `strength`, rule, `applies_to` | Cheap, grows linearly | Always |
+| **Entries** | Full decision record: rule, scope, exclusions, negative instances | ~30 lines each | When globs intersect the diff |
+| **Rationale** | The "why", extracted from spikes | Paragraphs to pages | When a decision is questioned or extended |
+| **Archaeology** | The spike itself, in Confluence | Unbounded | Rarely, by explicit link |
 
-The domain object currently managed by EP has this shape:
+This is progressive disclosure — the same principle the skill mechanism is built around. Spikes map onto it badly as whole documents but well once split by **kind of claim** rather than by document boundary.
 
-| Column          | Type           | Nullable      | Notes                                |
-| --------------- | -------------- | ------------- | ------------------------------------ |
-| `id`            | `VARCHAR(36)`  | `NOT NULL PK` | UUID, auto-generated                 |
-| `template_name` | `VARCHAR(255)` | `NOT NULL`    | Logical name, e.g. `"welcome-email"` |
-| `brand_id`      | `VARCHAR(36)`  | `NOT NULL`    | UUID FK (logical) to `brands.id`     |
-| `version`       | `VARCHAR(10)`  | `NOT NULL`    | e.g. `"v1"`, `"v2"`                  |
-| `subject`       | `TEXT`         | `NULL`        | Plain-text subject line              |
-| `body_text`     | `TEXT`         | `NULL`        | Plain-text fallback body             |
-| `body_html`     | `LONGTEXT`     | `NULL`        | HTML body                            |
-| `created_at`    | `TIMESTAMP`    | `NOT NULL`    | Set by `@CreationTimestamp`          |
-| `updated_at`    | `TIMESTAMP`    | `NOT NULL`    | Set by `@UpdateTimestamp`            |
+One spike typically yields several entries. One entry may draw on several spikes. Neither is a one-to-one mapping, which is why the spike itself is not the unit of ingestion.
 
-Two properties of this object matter for the decision below. The template is a **dynamic object** whose body (`body_text` / `body_html`) is essentially opaque payload rather than a structured domain type likely to become a formal contract, and the stack uses **no schema registry**. The working assumption is that these body fields are passed through to the target service as flat fields rather than reshaped into a structured object.
+### Where the ADR pattern fits
 
-## The Problem
+Keep spikes as spikes: narrative, exploratory, human-facing. Do not retrofit them into ADR format.
 
-Folding authoring into EP would **extend its responsibility** from "process notifications and render emails" to also "manage the data needed for processing," which violates single responsibility. Hence the idea of **splitting out a new service** to own the template (and eventually other) authoring lifecycle.
+What the ADR pattern contributes is its **fields** — explicit status, supersession pointer, and a structural separation of context / decision / consequences. Those fields live in the distilled entry. **The frontmatter is the ADR; the spike is its cited source.**
 
-That split raises the operative question: **how should EP obtain template data from the new service?** In particular, is there overhead to be saved by having EP read directly from the database through the Aurora reader endpoint instead of calling the new service's API?
+The ADR format exists because human teams hit this exact problem a decade before agents did: new joiners reading old design docs and implementing the rejected option. The agent version is the same problem with worse recall of narrative context.
 
-Beneath that question is the change that actually matters. User editing gives templates a **write-side lifecycle** — draft versus published, validation before publish, most likely version history. So the decision is not really "API or DB." It is a decision about how much of that authoring lifecycle should be allowed to leak into EP's read path.
+---
 
-A second dimension surfaced alongside it: **consistency over time**. Template editing and notification sending are independent workflows — a notification is triggered by an upstream domain event, not by an edit. The concern is the specific scenario in which an internal user edits a template and then wants to send a notification shortly afterwards: from what moment can a new notification be triggered such that it is guaranteed to render the updated template? The synchronous nature of an API call and the asynchronous nature of events answer that question differently, and — as detailed below — patterns exist on both sides to give the editor a clear answer.
+## 2. Problems this design has to solve
 
-## Potential Solutions
+### 2.1 Deliberation and decision are indistinguishable once chunked
 
-### 1. Event-carried state transfer (events over the existing outbox)
+This is the central hazard, and it attaches specifically to the content that is most valuable — the write-up of thinking through a problem to a solution.
 
-Here the new template service is the system of record. Whenever a template is published, it emits a template-changed event through the outbox. EP consumes those events and either maintains its own local, read-optimized copy of the data or uses the events purely as precise cache-invalidation signals over Redis.
+A spike working through a problem contains rejected options argued for persuasively, in the present tense. Pull a paragraph from the middle of "Options considered" and it reads exactly like a recommendation. Feeding spikes whole does not preserve the narrative arc that makes the rejection legible: the agent sees a retrieved fragment, not a document.
 
-The strength of this approach is that it keeps the two services genuinely independent. EP holds its own copy of the data, so it acquires no runtime dependency on the template service — rendering continues even if the authoring service is down. Invalidation becomes precise: the moment a template is published, EP hears about it, rather than waiting for a timer to expire. And because the flow stays asynchronous, it is consistent with the rest of the pipeline. The interface between the two services is the set of event fields rather than the physical table layout, which means each side can evolve its own storage freely.
+**Consequence:** every claim needs an explicit authority marker, and that marking *is* the distillation step. It cannot be inferred at retrieval time.
 
-The cost is the ongoing synchronization work. EP maintains a second copy of the data, so the consumer has to handle idempotency and event ordering to keep that copy correct. There is no meaningful initial-migration concern here — the services are not yet in production and only a single template exists today — so the cost is the steady-state discipline of keeping two copies consistent, not a one-off backfill.
+### 2.2 Freshness checks run in the wrong direction
 
-### 2. Read API on the new service
+Comparing modification times catches "the Confluence page changed and we are behind." The dangerous case is the page **did not change**: the decision was superseded in a PR discussion, a later spike, or an incident review, and nobody edited the old page. It shows green forever.
 
-In this option EP calls an API exposed by the new service on a cache miss, using either events or a short TTL to know when to refresh.
+Related: spike 12 supersedes spike 7, nobody edits spike 7, and the agent now holds two confidently-stated contradictory positions with no tiebreaker.
 
-Its appeal is simplicity. The API is a clean contract, so the schema boundary is preserved and EP stays ignorant of the authoring lifecycle — it only ever sees published, valid templates. There is no projection to build and keep in sync, which for a dataset this small and this slow-changing may be all the sophistication the problem warrants.
+**Mitigations:**
+- Supersession is recorded explicitly in the entry, not inferred.
+- The curated layer is the only thing with authority. Spikes are sources, not truth.
+- Track `last_confirmed` (against code) separately from `last_synced` (against Confluence). They answer different questions.
 
-The drawback is runtime coupling. On a cold cache, or when a large invalidation sweeps the cache at once, EP's ability to render emails depends on the template service being available. The network hop also remains, though only on cache misses.
+### 2.3 Rationale gets over-applied
 
-### 3. Direct DB read via the Aurora reader endpoint
+Agents given a "why" invoke it outside its scope. The exception-framework reasoning surfaces in a review comment about a build script; the one service that legitimately opted out gets flagged every time.
 
-Here EP reads the new service's tables directly through the reader endpoint.
+This is **not** an argument against providing rationale. Over-application is a property of *unscoped* claims. The counterfactual is not a quiet agent — it is an agent producing generically-correct review comments (null checks, naming, "consider extracting a method") that reviewers skim past. That failure is more common and harder to detect, because nothing looks wrong.
 
-In its favour, this saves both the hop and the API surface, and routing EP's reads to the replicas gives real runtime read/write isolation: EP's read load lands on the readers while the editor's writes land on the writer, so the two do not contend (setting aside the shared storage volume they still have in common).
+The trade is a silent failure for a loud one. Loud ones are measurable against the acceptance heuristic: does a human post the comment under their own name? False positives cost reviewer trust much faster than silence does, so they must be controlled — by scoping, per §3.
 
-Against it, this revives the **shared-database (integration-database) pattern**. Schema coupling returns even under single-team ownership, so the new service can no longer refactor its persistence — normalize tables, add a versioning scheme, change how drafts are stored — without breaking EP. EP is also forced to understand the authoring model itself, distinguishing published, valid rows from drafts and half-saved edits so that it never renders unpublished content into a real email. And decisively, a raw table read carries no signal that anything changed, so freshness falls back to a TTL regardless. This option therefore takes on the most coupling while still failing to solve the invalidation problem, and it drops a synchronous read into a pipeline that is otherwise entirely asynchronous.
+### 2.4 Confluence is an input surface
 
-> Redis is not a standalone option in any of these. A cache always needs both a source of truth and an invalidation strategy underneath it, and it sits on top of whichever read path is chosen. The one caution is not to let Redis itself quietly become a shared integration point between the two services.
+Lower risk when the tracked pages are deliberately selected and carefully curated, and near-zero once ingestion is PR-gated. Two residuals survive:
 
-## The Consistency-Over-Time Dimension
+- "Carefully curated" describes today's version and today's curators. Edit rights are usually much broader than that set. Pin the source version; a version bump requires re-approval rather than silent acceptance.
+- Page **comments** often hold the correction that never made it into the body. Ignoring them loses real signal — but they are also the least curated part of the page. Read them during extraction, surface them to the human reviewer, never ingest them unreviewed.
 
-The concern is legitimate, and it separates cleanly into two questions with different consistency profiles. Keeping them apart is what makes the answer tractable.
+Text in a wiki page is data, never instruction. Enforce that at ingestion rather than hoping for it. While ingesting, also scan for what should not leave Confluence at all: pasted payloads, customer identifiers, credentials in a debugging section. The plugin's service account almost certainly reads more spaces than any individual developer.
 
-The first question is **durability** — the edit is saved and will not be lost. The second is **propagation** — a notification triggered after the edit will render the updated template. On durability, both options are synchronous. Events do not make *saving* asynchronous; they make *propagation* asynchronous. In either design the editor's save is a REST call into the template service (the source of truth) that returns once the local transaction commits — and with the outbox, that commit includes the outbox row in the same transaction, so a `200` already means "durably saved and guaranteed to propagate." The editor gets immediate confirmation of the thing they most worry about, identically in both approaches.
+### 2.5 Nothing tells you whether adding a spike helped
 
-Propagation is where the two designs genuinely differ. Because a notification is triggered independently — by an upstream domain event, or by an internal user deliberately sending one after an edit — the operative question is: from what moment is a newly triggered notification guaranteed to use the new template? Cache repopulation, in every case here, happens on a cache miss; the difference is entirely in how and when the stale entry is removed.
+Without a measurement, the knowledge base only grows, and "how large should it be?" stays unanswerable in principle.
 
-- **API with synchronous invalidation.** If the edit request synchronously evicts EP's Redis key as part of its own flow, then the moment the save returns, the stale entry is already gone. The next notification cache-misses and repopulates the fresh template from the source of truth. This *is* synchronous end-to-end for the sending path: after "Saved," any triggered notification is guaranteed to render the new version, with no further machinery. This is the API's strongest card, and it answers the edit-then-send-soon scenario directly. Its cost is a coupling on the write path — the editor (or template service) must be able to reach EP's cache to evict it, either by knowing EP's cache-key scheme or by calling an EP invalidation endpoint, and the write then depends on that eviction succeeding. It also cannot be made synchronous in every design: if EP holds a full local projection rather than a read-through cache, there is nothing to evict — the data must be pushed, and pushing synchronously from the write path is exactly the request-reply coupling to avoid.
+Build a frozen set of PRs with known-good review outcomes and diff performance with and without each candidate document. Most additions will be neutral. Some will be **negative through dilution** — every token of domain lore competes for attention with the diff under review, and irrelevant retrieved context measurably hurts rather than being merely inert.
 
-- **Events.** The edit commits and emits; EP invalidates its cache (or updates its projection) when it consumes the event. Propagation is therefore eventual — immediately after "Saved," a triggered notification might still catch the old version until the event lands. The window is small (outbox → Debezium → EP) but non-zero, so the editor needs a signal for when it has closed.
+### 2.6 Ownership of the distilled layer
 
-That signal is where a **status event** earns its place, and it is what lets the event design match the API's answer to the edit-then-send question. The shape is a two-phase confirmation:
+- Fully generated → regeneration produces diffs nobody reviews.
+- Fully handwritten → drifts from the spikes.
+- **Reviewed artifact** → LLM-assisted extraction, human-approved via PR. This is the version that works, and it gives supersession somewhere to be recorded.
 
-1. The save returns "Saved" instantly, confirming durability.
-2. EP, after committing its cache/projection update, emits a `template-applied` event carrying the template id and version (or a correlation id).
-3. The template service consumes that event, marks the record "live," and the UI reflects it via an SSE/websocket push or a short poll on a status endpoint.
+Since the compiled files should not be versioned inside the plugin repo, the existing memory banks are the natural home. The plugin depends on them rather than embedding them.
 
-Once the editor sees "live," a triggered notification is guaranteed to use the new version — the same guarantee the synchronous eviction gives, arrived at asynchronously and made explicit to the user rather than assumed.
+---
 
-The editor's **read-your-writes** need for its own preview is separate from both mechanisms and simpler than either: the preview and read-back should hit the source of truth, not EP's cache. The authoring path reads from the service it just wrote to, so it is strongly consistent by construction. Only the sending path is subject to the propagation question above.
+## 3. Scoping
 
-The one trap to avoid — on the event side — is making the save itself block on EP's acknowledgement, i.e. synchronous request-reply over Kafka. That recouples the write path to EP's availability and latency and throws away the main benefit of the split. This is *not* the same as the API's synchronous cache eviction, which is a legitimate, bounded operation; the trap is specifically blocking a save on an asynchronous consumer's round-trip. So the rule is: **confirm durability synchronously; for propagation, either evict synchronously (API) or confirm asynchronously via a status event (events).**
+### 3.1 Push everything mechanizable out of the knowledge base first
 
-## Recommendation
+In a Java shop, most exception-framework invariants are ArchUnit rules. Several Kafka structural constraints are schema-registry compatibility settings or a custom Error Prone check.
 
-The recommendation is to **split the service and have EP consume *published* templates via events over the outbox (Solution 1)**, falling back to the Read API (Solution 2) if an event-fed projection proves to be over-engineering for a dataset this small.
+Anything a deterministic check can catch should be caught there — and then **explicitly marked in the entry as already gated**, so the agent does not duplicate CI in prose.
 
-The decisive reason is **long-run maintainability**. The whole point of the split is to give the template domain genuine autonomy over its own model, and only the event-based boundary actually delivers that. The new service stays free to reshape its persistence — versioning, draft storage, normalization — behind a stable interface, while EP owns a projection shaped for rendering. The direct-DB option would make the split cosmetic: two services on the org chart, still fused at the database, unable to evolve independently. Over years of change, that difference is what determines whether the boundary keeps paying off or slowly becomes a liability.
+What remains for the LLM layer is the genuinely non-static: is this the right event to emit at all, does this name match our terminology, does this change break an invariant that spans services. This cut alone removes a large part of the over-application surface, because the entries most prone to misfiring are usually the structural ones.
 
-Several further reasons reinforce that choice:
+### 3.2 Scope by path and symbol, not by prose
 
-- **The consistency concern is the API's strongest card, and the event design has a clean answer to it.** Synchronous cache eviction genuinely lets the API guarantee that a notification triggered after "Saved" uses the new template — a real advantage for the edit-then-send-soon scenario. The event design matches that guarantee with a two-phase status event, trading the immediate synchronous eviction for an explicit "live" confirmation, and in return keeps the write path decoupled from EP's cache rather than depending on it. This narrows the gap between the two candidates to a genuine trade-off; it does nothing for the direct DB read, which offers no invalidation signal at all.
+If `applies_to` reads "our REST-facing services", the agent must judge membership — and membership judgement under uncertainty is exactly where false positives come from. Globs and trigger symbols are checkable against the diff.
 
-- **It solves the freshness problem the other options fumble.** Publishing a template emits an event, which gives precise invalidation the instant the template changes. That is the difference between editors trusting the system and editors refreshing the page, wondering why the old version still went out. The direct-DB read is the sharpest contrast here: it offers no better invalidation than a plain TTL, so it takes on the most coupling for the least freshness benefit.
+```markdown
+---
+id: EXC-001
+status: accepted                    # accepted | superseded-by: EXC-004 | deprecated
+strength: invariant                 # invariant | default | preference
+applies_to:
+  - "services/*/src/main/java/**/web/**"
+  - "services/*/src/main/java/**/api/**"
+excludes:
+  - "services/legacy-billing/**"    # opted out, rationale §4
+  - "**/testFixtures/**"
+triggers: ["@ExceptionHandler", "ResponseEntity<ErrorResponse", "throw new"]
+enforced_by: "ArchUnitTest#domainExceptionsOnly"   # CI gates this — do not comment
+source: confluence:SPIKE-142@v9
+rationale: rationale/EXC-001.md
+last_confirmed: 2026-07-14
+---
 
-- **It removes runtime coupling rather than adding it.** Because EP keeps its own copy, downtime in the template service does not stop email rendering — the one dependency least wanted in a notifications pipeline.
+**Rule.** One imperative sentence.
 
-- **It happens to match the architecture already in place.** The pipeline is already fully asynchronous through Kafka, and Debezium in outbox mode is already operated, so events are existing machinery rather than something new to introduce. This is a genuine convenience, but it is a convenience and not the reason: the architecture is not fixed, and any of these approaches could be built. The case for events rests on maintainability first; the fact that the current stack makes them cheap to adopt is a welcome coincidence, not the driver.
+**Why.** Four sentences, or a pointer to the rationale file.
 
-### A caveat worth stating honestly
+**Do not raise when.** The PR description cites an EXC-001 exemption;
+the change is confined to `**/internal/**`; the handler is being deleted.
+```
 
-With an opaque, dynamic body and no schema registry, the "event as a governed contract" benefit is thin. Passing `body_text` / `body_html` through as flat fields is essentially shipping blobs, and there is not much to formalize. But the load-bearing part of the decoupling survives intact: EP binds to *event fields*, not to `SELECT`s against another service's tables, so the template service keeps its freedom to reshape storage without touching EP. That freedom is precisely what the direct-DB read forfeits. What the caveat actually does is narrow the gap between *events and the API* — both hide storage behind an interface — not the gap between either of them and the direct read. Registry-less schema evolution then rests on team discipline, which for a single team is the same coordination that already makes design-time coupling a non-issue.
+Two properties of this schema are worth designing for deliberately:
 
-### Two concrete cautions from the schema
+- **`applies_to` is simultaneously the correctness constraint and the retrieval key.** The index holds only `id`, `strength`, rule, and `applies_to`; entry bodies load only for entries whose globs intersect the changed paths. Scoping and context budget turn out to be the same mechanism.
+- **`source: SPIKE-142@v9` makes the freshness check compatible with the PR gate.** Sync compares the live Confluence version against the pin; on drift it flags the entry and opens a PR, rather than overwriting curated text.
 
-- **`body_html LONGTEXT` versus Kafka's ~1 MB default message ceiling.** Most email bodies sit comfortably under it, but a template with inlined CSS or base64 images can creep up. If that is plausible, reach for a **claim-check**: the event carries the metadata and a pointer, while the body lives in object storage. This keeps the event small without reintroducing a synchronous read on the hot path.
+### 3.3 Separate strength from scope
 
-- **The `version` column is doing quiet work.** If a publish mints a *new* immutable version, propagation becomes almost trivial — EP appends a row, idempotency falls out of `(template_name, brand_id, version)`, and event ordering barely matters, since the only mutable state is a "which version is live" pointer. But `updated_at` hints that in-place edits happen too. Pinning down which model applies matters, because immutable-versioned templates make both the projection and its idempotency dramatically simpler than in-place mutation with last-write-wins.
+Most of the damage from over-application is not wrong content — it is a preference delivered in the register of an invariant. Make `strength` govern the speech act explicitly in the plugin prompt:
 
-### Through-line
+| `strength` | Agent behaviour |
+|---|---|
+| `invariant` | State plainly as a defect. |
+| `default` | Ask for justification, phrased as a question. |
+| `preference` | Do not raise unless the PR author asked for style feedback. |
 
-The direct DB read optimizes the single cost — one network hop — that the Redis cache had already mostly neutralized, in exchange for precisely the coupling the split exists to escape. Events keep the boundary clean and the pipeline asynchronous, they handle the editor's confirmation need through a two-phase durability/propagation split, and they do so in a way that stays maintainable as both services grow.
+Be stingy with the top tier. Demote aggressively in review.
+
+If an entry cannot be written with a concrete `applies_to`, it is not a decision yet — it is a value. Values belong in the always-loaded core page, not in the review path.
+
+### 3.4 Negative instances
+
+Treat `Do not raise when` as load-bearing, not boilerplate. Negative instances constrain behaviour considerably better than hoping a positive scope is read narrowly.
+
+It is also the natural home for the exception discovered the first time the agent misfires — which makes misfires productive rather than merely annoying.
+
+---
+
+## 4. Workflow
+
+### 4.1 Registry
+
+A `spikes.yaml` in the plugin repo lists **only** the tracked pages:
+
+```yaml
+- id: SPIKE-142
+  page_id: "123456789"
+  title: "Exception handling across microservices"
+  ingested_version: 9
+  entries: [EXC-001, EXC-002, EXC-005]
+```
+
+Adding a page here is itself a PR. This is where "not every Confluence page is tracked" gets enforced structurally rather than by discipline.
+
+### 4.2 Extraction (new spike)
+
+A command — `/distill SPIKE-142` — fetches the page and runs two passes:
+
+**Pass 1 — classify.** Each section is labelled `normative` / `rationale` / `archaeology` / `rejected-option`. Rejected options are tagged explicitly so nothing from them can become a rule.
+
+**Pass 2 — emit.** Candidate entries are generated from `normative` sections only, with rationale linked rather than inlined.
+
+**Grounding requirement:** the extraction agent must leave `applies_to` empty when it cannot ground the scope in real paths. Allowing it to guess produces plausible globs that match nothing and fail silently. Instead, it proposes globs, then **verifies** them against the actual repo and reports hit counts in the PR body. Zero hits and ten-thousand hits are both review signals.
+
+**Conflict detection:** search existing entries for overlapping globs and triggers; surface candidates as "possible conflict with EXC-003" in the PR body. Supersession cannot be detected reliably, but the search narrows the human's job considerably.
+
+### 4.3 The PR
+
+Generated branch, one file per entry so review happens per decision. The description carries:
+
+1. Proposed rule text.
+2. The spike section it came from, with link and anchor.
+3. Glob hit counts from the verification step.
+4. **A dry run against N recent merged PRs touching matching paths, showing the comments the entry *would* have produced.**
+
+Item 4 is what makes the review a real decision rather than a rubber stamp. A reviewer can read three sample comments and know immediately whether the scope is wrong. **Build this first** — everything else is plumbing.
+
+### 4.4 Human review
+
+The reviewer's checklist:
+
+- Is `strength` right? (Demote aggressively.)
+- Is `applies_to` too broad?
+- Does this duplicate something `enforced_by` already gates?
+- Does it supersede an existing entry?
+- Do the dry-run comments read like something you would post under your own name?
+
+### 4.5 Update — spike changed
+
+Scheduled job compares live version against the pin. On drift:
+
+1. Mark affected entries `unconfirmed` in the index. The plugin keeps using them but **downgrades `invariant` to `default` while unconfirmed** — degraded confidence rather than silence.
+2. Open a PR showing a diff of only the spike sections the entries actually **cite**, not the whole page. Most edits touch nothing cited, so most of these auto-close.
+
+### 4.6 Update — code changed
+
+The direction people skip, and the one Confluence-side polling cannot see. Fail CI in the plugin repo when:
+
+- An entry's `applies_to` no longer matches anything.
+- An entry's `enforced_by` test no longer exists.
+
+Dead entries are worse than missing ones: they consume context and produce comments about code that no longer exists in that shape.
+
+### 4.7 Feedback loop
+
+When a reviewer deletes or edits a generated comment, capture the entry ID that produced it. A monthly report of entries with **high generation and low acceptance** is the demotion queue — and the natural source of new `Do not raise when` clauses.
+
+This closes the loop with the acceptance heuristic already in use: whether a human posts the comment under their own name, how many, verbatim or edited, and what changed.
+
+---
+
+## 5. Sizing
+
+The constraint is not the context window. It is that every token of domain lore competes for attention with the diff under review, and irrelevant retrieved context measurably degrades output rather than being inert.
+
+- **Always-loaded core:** one page. Terminology and hard invariants only.
+- **Index:** one line per decision. Grows linearly and stays cheap.
+- **Entries:** unbounded in count, bounded in what loads — only globs intersecting the diff.
+- **Rationale:** unbounded; loaded only on demand.
+
+If the always-loaded layer needs to grow past a page or two, that is a signal the invariants are not yet crisp — not a signal to raise the budget.
+
+---
+
+## 6. Build order
+
+1. **Dry run against recent PRs.** The measurement instrument. Without it the PR gate is ceremonial and sizing is guesswork.
+2. **Entry schema + index + glob-intersection loading.** The scoping mechanism and the retrieval mechanism in one.
+3. **`/distill` two-pass extraction with glob verification.**
+4. **Registry + PR generation.**
+5. **Drift detection, both directions** (Confluence-side and code-side).
+6. **Acceptance telemetry and the demotion queue.**
+
+Steps 1–2 are worth building before ingesting anything at scale. They determine whether every subsequent addition is an improvement or dilution.
